@@ -440,8 +440,8 @@ fn shape_for_table(
                     false,
                 ),
                 type_label: type_text,
-                type_color: types::type_color(field.type_code).to_string(),
-                glyph: glyph_name(field.type_code),
+                type_color: field.type_color().to_string(),
+                glyph: glyph_name(field.type_glyph()),
                 badges,
                 hidden: field.hidden,
                 tip: field.tip.clone(),
@@ -488,8 +488,8 @@ fn badges_for(field: &crate::model::Field) -> Vec<Badge> {
     badges
 }
 
-fn glyph_name(type_code: i64) -> &'static str {
-    match types::type_glyph(type_code) {
+fn glyph_name(glyph: types::Glyph) -> &'static str {
+    match glyph {
         types::Glyph::Boolean => "boolean",
         types::Glyph::Number => "number",
         types::Glyph::Date => "date",
@@ -497,6 +497,7 @@ fn glyph_name(type_code: i64) -> &'static str {
         types::Glyph::Text => "text",
         types::Glyph::Blob => "blob",
         types::Glyph::Image => "image",
+        types::Glyph::Object => "object",
         types::Glyph::Unknown => "unknown",
     }
 }

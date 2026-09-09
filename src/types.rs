@@ -24,7 +24,7 @@ pub const TYPES: &[(i64, &str, &str, Glyph)] = &[
     (14, "Alpha", "#16a34a", Glyph::Text),
     (17, "Text", "#15803d", Glyph::Text),
     (18, "Blob", "#64748b", Glyph::Blob),
-    (21, "Blob", "#64748b", Glyph::Blob),
+    (21, "Object", "#4f46e5", Glyph::Object),
 ];
 
 pub const UNKNOWN_COLOR: &str = "#94a3b8";
@@ -38,7 +38,28 @@ pub enum Glyph {
     Text,
     Blob,
     Image,
+    Object,
     Unknown,
+}
+
+/// 4D stores every string field under one of these codes. The *displayed* type
+/// is not implied by the code alone: 4D shows `Alpha` when the field carries a
+/// length limit and `Text` when it does not. See the `$type=10 or $type=14 or
+/// $type=17` branch of `structure_to_html.xml` in `references/`.
+const STRING_CODES: &[i64] = &[10, 14, 17];
+const ALPHA_CODE: i64 = 10;
+const TEXT_CODE: i64 = 17;
+
+/// Collapses a raw code plus its length limit into the code whose row in
+/// [`TYPES`] describes how 4D actually presents the field.
+pub fn canonical_code(code: i64, limiting_length: Option<i64>) -> i64 {
+    if !STRING_CODES.contains(&code) {
+        return code;
+    }
+    match limiting_length {
+        Some(len) if len > 0 => ALPHA_CODE,
+        _ => TEXT_CODE,
+    }
 }
 
 pub fn type_label(code: i64) -> String {
@@ -73,6 +94,33 @@ mod tests {
     fn known_codes_resolve() {
         assert_eq!(type_label(4), "Longint");
         assert_eq!(type_label(17), "Text");
+    }
+
+    #[test]
+    fn object_is_not_a_blob() {
+        // 21 is `Object`. It becomes a BLOB only in the SQL mapping, which
+        // describes storage rather than the type shown to the user.
+        assert_eq!(type_label(21), "Object");
+        assert_eq!(type_glyph(21), Glyph::Object);
+        assert_ne!(type_color(21), type_color(18));
+    }
+
+    #[test]
+    fn string_codes_resolve_by_length_limit() {
+        for code in [10, 14, 17] {
+            assert_eq!(type_label(canonical_code(code, Some(40))), "Alpha");
+            assert_eq!(type_label(canonical_code(code, None)), "Text");
+            // A limit of zero means "no limit", same as the attribute being absent.
+            assert_eq!(type_label(canonical_code(code, Some(0))), "Text");
+        }
+    }
+
+    #[test]
+    fn non_string_codes_ignore_the_length_limit() {
+        for code in [1, 4, 11, 18, 21, 999] {
+            assert_eq!(canonical_code(code, Some(40)), code);
+            assert_eq!(canonical_code(code, None), code);
+        }
     }
 
     #[test]
