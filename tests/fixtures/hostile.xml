@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE base SYSTEM "http://www.4d.com/dtd/2007/base.dtd">
+<base name="&lt;script&gt;alert('base')&lt;/script&gt;" uuid="H1">
+	<table name="&lt;script&gt;alert(1)&lt;/script&gt;&quot;&gt;&lt;img src=x onerror=alert(1)&gt;" uuid="T1" id="1">
+		<field name="&lt;/script&gt;&lt;script&gt;alert(2)&lt;/script&gt;" uuid="F1" type="4" unique="true" id="1">
+			<field_extra mandatory="true">
+				<tip>javascript:alert(3) &amp; &lt;b&gt;bold&lt;/b&gt; &quot;quoted&quot;</tip>
+			</field_extra>
+		</field>
+		<field name="Normal" uuid="F2" type="17" id="2"/>
+		<primary_key field_name="&lt;/script&gt;&lt;script&gt;alert(2)&lt;/script&gt;" field_uuid="F1"/>
+		<table_extra>
+			<editor_table_info>
+				<color red="20" green="120" blue="200" alpha="255"/>
+				<coordinates left="10" top="10" width="144" height="100"/>
+			</editor_table_info>
+		</table_extra>
+	</table>
+	<table name="OTHER" uuid="T2" id="2">
+		<field name="Ref" uuid="F3" type="4" id="1"/>
+		<table_extra>
+			<editor_table_info>
+				<coordinates left="300" top="10" width="144" height="100"/>
+			</editor_table_info>
+		</table_extra>
+	</table>
+	<relation uuid="R1" name_Nto1="&lt;/script&gt;--&gt;&lt;svg onload=alert(4)&gt;" name_1toN="back&quot;link">
+		<related_field kind="source">
+			<field_ref uuid="F3" name="Ref">
+				<table_ref uuid="T2" name="OTHER"/>
+			</field_ref>
+		</related_field>
+		<related_field kind="destination">
+			<field_ref uuid="F1" name="&lt;/script&gt;&lt;script&gt;alert(2)&lt;/script&gt;">
+				<table_ref uuid="T1" name="&lt;script&gt;alert(1)&lt;/script&gt;&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"/>
+			</field_ref>
+		</related_field>
+	</relation>
+</base>

@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Test
+        run: cargo test
+
+      - name: Acceptance run
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release
+          bin=target/release/4d-catalog-diagram
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+
+          # Every output format produces a non-empty file.
+          "$bin" references/InvoicesDemo.xml -o out.html -q
+          "$bin" references/InvoicesDemo.xml -f svg -o out.svg -q
+          "$bin" references/InvoicesDemo.xml -f png -o out.png -q
+          for f in out.html out.svg out.png; do
+            test -s "$f" || { echo "$f is empty"; exit 1; }
+          done
+
+          # inspect emits valid JSON with the expected counts.
+          "$bin" inspect references/InvoicesDemo.xml > catalog.json
+          python3 -c "
+          import json
+          d = json.load(open('catalog.json'))
+          assert d['table_count'] == 5, d['table_count']
+          assert d['relation_count'] == 3, d['relation_count']
+          "
+
+          # Identical command, identical bytes.
+          "$bin" references/InvoicesDemo.xml -o - -q > first.html
+          "$bin" references/InvoicesDemo.xml -o - -q > second.html
+          cmp first.html second.html
+
+          # Documented exit codes.
+          set +e
+          "$bin" render does-not-exist.xml -q 2>/dev/null
+          test $? -eq 2 || { echo "expected exit 2 for a missing input"; exit 1; }
+          "$bin" render references/InvoicesDemo.xml --tables-match '^NOPE$' -o - -q 2>/dev/null
+          test $? -eq 4 || { echo "expected exit 4 for an empty selection"; exit 1; }
