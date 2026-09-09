@@ -80,8 +80,22 @@ pub struct Field {
 }
 
 impl Field {
+    /// The code as 4D presents it, which for string fields depends on whether
+    /// a length limit is set.
+    fn display_code(&self) -> i64 {
+        crate::types::canonical_code(self.type_code, self.limiting_length)
+    }
+
     pub fn type_label(&self) -> String {
-        crate::types::type_label(self.type_code)
+        crate::types::type_label(self.display_code())
+    }
+
+    pub fn type_color(&self) -> &'static str {
+        crate::types::type_color(self.display_code())
+    }
+
+    pub fn type_glyph(&self) -> crate::types::Glyph {
+        crate::types::type_glyph(self.display_code())
     }
 }
 

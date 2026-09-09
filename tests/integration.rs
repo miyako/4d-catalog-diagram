@@ -827,3 +827,66 @@ fn html_ships_the_deep_link_and_minimap_machinery() {
     // Rows must be addressable by field name for `#TABLE.FIELD` to work.
     assert!(html.contains(r#"data-field="Invoice_Number""#));
 }
+
+/// 4D's own `structure_to_html.xml` transform is the authority on how a field
+/// type is *presented*. Type 21 is `Object`; it maps to `BLOB` only in
+/// `structure-to-sql.xml`, which describes SQL storage, not the type name.
+#[test]
+fn object_fields_are_labelled_object_not_blob() {
+    let catalog = invoices();
+    let numbers = catalog
+        .tables
+        .iter()
+        .find(|t| t.name == "CLIENTS")
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.name == "Numbers")
+        .unwrap();
+
+    assert_eq!(numbers.type_code, 21);
+    assert_eq!(numbers.type_label(), "Object");
+
+    // And nowhere in the catalog does a type 21 field claim to be a Blob.
+    let mislabelled: Vec<_> = catalog
+        .tables
+        .iter()
+        .flat_map(|t| &t.fields)
+        .filter(|f| f.type_code == 21 && f.type_label() != "Object")
+        .map(|f| f.name.clone())
+        .collect();
+    assert!(mislabelled.is_empty(), "mislabelled: {mislabelled:?}");
+}
+
+/// Codes 10, 14 and 17 are all "string". 4D shows `Alpha` when the field
+/// carries a length limit and `Text` when it does not, so the code alone is
+/// not enough to name the type.
+#[test]
+fn string_fields_are_alpha_only_when_length_limited() {
+    let catalog = invoices();
+    let clients = catalog.tables.iter().find(|t| t.name == "CLIENTS").unwrap();
+    let field = |name: &str| clients.fields.iter().find(|f| f.name == name).unwrap();
+
+    let limited = field("Name");
+    assert_eq!(limited.type_code, 10);
+    assert_eq!(limited.limiting_length, Some(40));
+    assert_eq!(limited.type_label(), "Alpha");
+
+    let unlimited = field("Address");
+    assert_eq!(unlimited.type_code, 10);
+    assert_eq!(unlimited.limiting_length, None);
+    assert_eq!(unlimited.type_label(), "Text");
+}
+
+/// The text exports carry the same corrected labels as the diagram.
+#[test]
+fn exports_use_the_display_type_names() {
+    let catalog = invoices();
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let mmd = catalog_diagram::export::mermaid(&catalog, &selection, false);
+
+    assert!(mmd.contains("Object Numbers"), "{mmd}");
+    assert!(mmd.contains("Text Address"), "{mmd}");
+    assert!(mmd.contains("Alpha Name"), "{mmd}");
+    assert!(!mmd.contains("Blob Numbers"), "{mmd}");
+}

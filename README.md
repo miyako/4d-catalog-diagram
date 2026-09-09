@@ -11,6 +11,9 @@ standalone SVG, or a PNG.
 - **Deterministic.** The same command on the same input produces byte-identical
   output, so diagrams can be committed and diffed.
 
+<!-- Regenerate with:
+     4d-catalog-diagram references/InvoicesDemo.xml \
+       -f png --layout as-designed --scale 1 -o docs/example.png -->
 ![Example diagram](docs/example.png)
 
 ## Install
@@ -66,6 +69,20 @@ with `<field>` children, plus `<relation>` elements. `references/InvoicesDemo.xm
 in this repository is a complete example. Parsing is permissive — unknown
 elements and attributes are ignored rather than rejected, and UTF-8, UTF-16 and
 legacy single-byte encodings are detected automatically.
+
+### Field types
+
+Type names follow 4D's own presentation rules rather than the raw type code:
+
+- **Type 21 is `Object`**, not `Blob`. 4D's SQL mapping stores an object field
+  as a BLOB, but that is a storage detail — the structure editor shows it as
+  `Object`.
+- **`Alpha` vs `Text` is decided by the length limit, not the code.** Codes 10,
+  14 and 17 are all string fields; a field with a `limiting_length` is shown as
+  `Alpha(n)` and one without is shown as `Text`.
+
+Unrecognised codes degrade to a generic `Type {n}` label instead of failing, so
+a newer catalog still renders.
 
 ## Usage
 
