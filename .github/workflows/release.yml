@@ -1,8 +1,8 @@
 name: Build and Release
 
-# Six binaries: {linux, macos, windows} x {x64, arm64}. Every one is a single
-# self-contained executable with no runtime dependency beyond the OS itself,
-# and each job proves that before uploading.
+# Six binaries: {linux, macos, windows} x {x64, arm64}. Every build runs on a
+# native runner for its own architecture, so each one can actually execute and
+# prove itself before being uploaded.
 
 on:
   push:
@@ -22,7 +22,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux — musl, fully static
+  # Linux - musl, fully static
   # ---------------------------------------------------------------------------
   linux:
     strategy:
@@ -32,16 +32,12 @@ jobs:
         include:
           - arch: x64
             target: x86_64-unknown-linux-musl
-            cross_package: amd64
-            cc_prefix: x86_64-linux-gnu
-            native: true
+            runner: ubuntu-24.04
           - arch: arm64
             target: aarch64-unknown-linux-musl
-            cross_package: arm64
-            cc_prefix: aarch64-linux-gnu
-            native: false
+            runner: ubuntu-24.04-arm
 
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
 
     env:
       ARTIFACT: 4d-catalog-diagram-linux-${{ matrix.arch }}
@@ -49,39 +45,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install packages
+      - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y crossbuild-essential-${{ matrix.cross_package }}
+          sudo apt-get install -y musl-tools
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          key: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Build
-        env:
-          # Rust ships its own musl libc, so the GNU cross-gcc is only ever used
-          # as the linker driver.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Verify the binary is static
         run: |
-          bin=target/${{ matrix.target }}/release/4d-catalog-diagram
+          bin="target/${{ matrix.target }}/release/4d-catalog-diagram"
           file "$bin"
           file "$bin" | grep -q "statically linked" || {
             echo "::error::binary is not statically linked"
             exit 1
           }
-          # `ldd` on a static binary must report no dynamic dependencies.
+          # A static binary has no dynamic dependencies at all.
           if ldd "$bin" 2>&1 | grep -qv "not a dynamic executable"; then
             echo "::error::unexpected dynamic dependencies"
             ldd "$bin"
@@ -89,30 +74,25 @@ jobs:
           fi
 
       - name: Smoke test
-        if: matrix.native
-        run: |
-          bin=target/${{ matrix.target }}/release/4d-catalog-diagram
-          "$bin" --version
-          "$bin" inspect references/InvoicesDemo.xml > /dev/null
-          "$bin" references/InvoicesDemo.xml -o - -q > a.html
-          "$bin" references/InvoicesDemo.xml -o - -q > b.html
-          cmp a.html b.html
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram"
 
-      - name: Package
+      - name: Archive
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/4d-catalog-diagram staging/
+          cp "target/${{ matrix.target }}/release/4d-catalog-diagram" staging/
           cp README.md LICENSE staging/
-          ${{ matrix.cc_prefix }}-strip staging/4d-catalog-diagram || strip staging/4d-catalog-diagram || true
+          strip staging/4d-catalog-diagram || true
           tar -cJf "${ARTIFACT}.tar.xz" -C staging .
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # macOS — arm64 runner, x64 cross-compiled
+  # macOS
   # ---------------------------------------------------------------------------
   macos:
     strategy:
@@ -122,62 +102,47 @@ jobs:
         include:
           - arch: x64
             target: x86_64-apple-darwin
-            native: false
+            runner: macos-13
           - arch: arm64
             target: aarch64-apple-darwin
-            native: true
+            runner: macos-14
 
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
 
     env:
       ARTIFACT: 4d-catalog-diagram-macos-${{ matrix.arch }}
-      # Anything older than this is unsupported by Apple.
       MACOSX_DEPLOYMENT_TARGET: "11.0"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          key: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Verify dynamic dependencies
         run: |
-          bin=target/${{ matrix.target }}/release/4d-catalog-diagram
+          bin="target/${{ matrix.target }}/release/4d-catalog-diagram"
+          file "$bin"
           otool -L "$bin"
-          # Only OS-provided libraries may be linked. Anything from Homebrew or
-          # a local build directory would not exist on a user's machine.
-          if otool -L "$bin" | tail -n +2 | grep -vE "^\s+/usr/lib/|^\s+/System/Library/"; then
+          # Only OS-provided libraries may be linked. A Homebrew or build-tree
+          # path would simply not exist on a user's machine.
+          if otool -L "$bin" | tail -n +2 | grep -vE "^[[:space:]]+(/usr/lib/|/System/Library/)"; then
             echo "::error::unexpected non-system dynamic dependency"
             exit 1
           fi
-          lipo -info "$bin"
 
       - name: Smoke test
-        if: matrix.native
-        run: |
-          bin=target/${{ matrix.target }}/release/4d-catalog-diagram
-          "$bin" --version
-          "$bin" inspect references/InvoicesDemo.xml > /dev/null
-          "$bin" references/InvoicesDemo.xml -f png -o /tmp/out.png -q
-          test -s /tmp/out.png
-          "$bin" references/InvoicesDemo.xml -o - -q > a.html
-          "$bin" references/InvoicesDemo.xml -o - -q > b.html
-          cmp a.html b.html
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram"
 
-      - name: Package
+      - name: Archive
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/4d-catalog-diagram staging/
+          cp "target/${{ matrix.target }}/release/4d-catalog-diagram" staging/
           cp README.md LICENSE staging/
           strip -x staging/4d-catalog-diagram || true
           tar -cJf "${ARTIFACT}.tar.xz" -C staging .
@@ -186,9 +151,11 @@ jobs:
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Windows — MSVC, static CRT
+  # Windows - MSVC with the static CRT, so no redistributable is needed
   # ---------------------------------------------------------------------------
   windows:
     strategy:
@@ -198,36 +165,27 @@ jobs:
         include:
           - arch: x64
             target: x86_64-pc-windows-msvc
-            native: true
+            runner: windows-2022
           - arch: arm64
             target: aarch64-pc-windows-msvc
-            native: false
+            runner: windows-11-arm
 
-    runs-on: windows-2022
+    runs-on: ${{ matrix.runner }}
 
     env:
       ARTIFACT: 4d-catalog-diagram-windows-${{ matrix.arch }}
+      RUSTFLAGS: -C target-feature=+crt-static
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          key: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Build
-        shell: bash
-        env:
-          # Static CRT so the binary runs without a Visual C++ redistributable.
-          RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Verify dynamic dependencies
         shell: pwsh
@@ -235,29 +193,23 @@ jobs:
           $bin = "target/${{ matrix.target }}/release/4d-catalog-diagram.exe"
           $dumpbin = Get-ChildItem -Path "C:/Program Files/Microsoft Visual Studio" -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
-          if (-not $dumpbin) { Write-Host "dumpbin not found, skipping"; exit 0 }
+          if (-not $dumpbin) {
+            Write-Host "dumpbin not found, skipping dependency check"
+            exit 0
+          }
           $out = & $dumpbin.FullName /DEPENDENTS $bin
           $out
-          # Only core OS DLLs are acceptable; VCRUNTIME/MSVCP would mean the
-          # static CRT did not take effect.
-          $bad = $out | Select-String -Pattern "VCRUNTIME|MSVCP|api-ms-win-crt"
-          if ($bad) {
+          # VCRUNTIME/MSVCP would mean the static CRT did not take effect.
+          if ($out | Select-String -Pattern "VCRUNTIME|MSVCP|api-ms-win-crt") {
             Write-Host "::error::binary depends on the Visual C++ runtime"
             exit 1
           }
 
       - name: Smoke test
-        if: matrix.native
         shell: bash
-        run: |
-          bin="target/${{ matrix.target }}/release/4d-catalog-diagram.exe"
-          "$bin" --version
-          "$bin" inspect references/InvoicesDemo.xml > /dev/null
-          "$bin" references/InvoicesDemo.xml -o - -q > a.html
-          "$bin" references/InvoicesDemo.xml -o - -q > b.html
-          cmp a.html b.html
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram.exe"
 
-      - name: Package
+      - name: Archive
         shell: bash
         run: |
           mkdir -p staging
@@ -269,6 +221,8 @@ jobs:
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
 
   # ---------------------------------------------------------------------------
   release:
