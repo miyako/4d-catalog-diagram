@@ -1,0 +1,250 @@
+name: Build and Release
+
+# Six binaries: {linux, macos, windows} x {x64, arm64}. Every build runs on a
+# native runner for its own architecture, so each one can actually execute and
+# prove itself before being uploaded.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux - musl, fully static
+  # ---------------------------------------------------------------------------
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      ARTIFACT: 4d-catalog-diagram-linux-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify the binary is static
+        run: |
+          bin="target/${{ matrix.target }}/release/4d-catalog-diagram"
+          file "$bin"
+          file "$bin" | grep -q "statically linked" || {
+            echo "::error::binary is not statically linked"
+            exit 1
+          }
+          # A static binary has no dynamic dependencies at all.
+          if ldd "$bin" 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "::error::unexpected dynamic dependencies"
+            ldd "$bin"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram"
+
+      - name: Archive
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/4d-catalog-diagram" staging/
+          cp README.md LICENSE staging/
+          strip staging/4d-catalog-diagram || true
+          tar -cJf "${ARTIFACT}.tar.xz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # macOS
+  # ---------------------------------------------------------------------------
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            target: x86_64-apple-darwin
+            runner: macos-13
+          - arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-14
+
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      ARTIFACT: 4d-catalog-diagram-macos-${{ matrix.arch }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify dynamic dependencies
+        run: |
+          bin="target/${{ matrix.target }}/release/4d-catalog-diagram"
+          file "$bin"
+          otool -L "$bin"
+          # Only OS-provided libraries may be linked. A Homebrew or build-tree
+          # path would simply not exist on a user's machine.
+          if otool -L "$bin" | tail -n +2 | grep -vE "^[[:space:]]+(/usr/lib/|/System/Library/)"; then
+            echo "::error::unexpected non-system dynamic dependency"
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram"
+
+      - name: Archive
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/4d-catalog-diagram" staging/
+          cp README.md LICENSE staging/
+          strip -x staging/4d-catalog-diagram || true
+          tar -cJf "${ARTIFACT}.tar.xz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Windows - MSVC with the static CRT, so no redistributable is needed
+  # ---------------------------------------------------------------------------
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      ARTIFACT: 4d-catalog-diagram-windows-${{ matrix.arch }}
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify dynamic dependencies
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/4d-catalog-diagram.exe"
+          $dumpbin = Get-ChildItem -Path "C:/Program Files/Microsoft Visual Studio" -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            Write-Host "dumpbin not found, skipping dependency check"
+            exit 0
+          }
+          $out = & $dumpbin.FullName /DEPENDENTS $bin
+          $out
+          # VCRUNTIME/MSVCP would mean the static CRT did not take effect.
+          if ($out | Select-String -Pattern "VCRUNTIME|MSVCP|api-ms-win-crt") {
+            Write-Host "::error::binary depends on the Visual C++ runtime"
+            exit 1
+          }
+
+      - name: Smoke test
+        shell: bash
+        run: ./.github/smoke-test.sh "target/${{ matrix.target }}/release/4d-catalog-diagram.exe"
+
+      - name: Archive
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/4d-catalog-diagram.exe" staging/
+          cp README.md LICENSE staging/
+          tar -cJf "${ARTIFACT}.tar.xz" -C staging .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.tar.xz
+          if-no-files-found: error
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*.tar.xz

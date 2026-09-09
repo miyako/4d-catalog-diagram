@@ -1,0 +1,37 @@
+[package]
+name = "catalog-diagram"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Render a 4D database catalog (structure XML) as an interactive HTML diagram, SVG, or PNG"
+license = "MIT"
+repository = "https://github.com/miyako/4d-catalog-diagram"
+readme = "README.md"
+
+[[bin]]
+name = "4d-catalog-diagram"
+path = "src/main.rs"
+
+[lib]
+name = "catalog_diagram"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help"] }
+encoding_rs = "0.8"
+regex = "1"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ttf-parser = "0.25"
+resvg = { version = "0.45", default-features = false, features = ["text"] }
+tiny-skia = "0.11"
+usvg = { version = "0.45", default-features = false, features = ["text"] }
+fontdb = { version = "0.23", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
