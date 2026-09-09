@@ -93,6 +93,11 @@ pub fn render(variants: &[Variant], options: &HtmlOptions) -> String {
     out.push_str("</g></svg>");
 
     out.push_str(&toolbar());
+    // Only useful once a diagram is too big to take in at a glance; the script
+    // populates and unhides it when the active scene is dense enough.
+    out.push_str(
+        r#"<svg id="minimap" width="180" height="120" viewBox="0 0 180 120" aria-hidden="true" hidden><g id="minimap-cards"></g><rect id="minimap-view" class="mm-view" x="0" y="0" width="0" height="0"/></svg>"#,
+    );
     out.push_str(r#"<div id="popup" hidden></div>"#);
     out.push_str("</main>");
 

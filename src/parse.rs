@@ -7,7 +7,7 @@
 //! `<!DOCTYPE base SYSTEM "http://www.4d.com/dtd/2007/base.dtd">` parses
 //! identically with or without network access.
 
-use crate::error::{AppError, Result};
+use crate::error::{AppError, Result, XmlPosition};
 use crate::model::{Catalog, Color, Coordinates, Field, Index, Relation, Table};
 
 /// Decode raw bytes to a `String`, honouring a BOM or the encoding declared in
@@ -75,6 +75,23 @@ fn declared_encoding(bytes: &[u8]) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Resolve a `roxmltree` error to a line, a column and the offending source
+/// line. `roxmltree` reports 1-based positions.
+fn xml_position(text: &str, error: &roxmltree::Error) -> Option<XmlPosition> {
+    let pos = error.pos();
+    let excerpt = text
+        .lines()
+        .nth(pos.row.saturating_sub(1) as usize)
+        .unwrap_or_default()
+        .trim_end()
+        .to_string();
+    Some(XmlPosition {
+        line: pos.row,
+        column: pos.col,
+        excerpt,
+    })
+}
+
 pub fn parse_bytes(bytes: &[u8]) -> Result<Catalog> {
     let (text, mut warnings) = decode(bytes);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_string();
@@ -85,8 +102,17 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<Catalog> {
         allow_dtd: true,
         ..roxmltree::ParsingOptions::default()
     };
-    let doc = roxmltree::Document::parse_with_options(&text, options)
-        .map_err(|e| AppError::MalformedXml(format!("input is not well-formed XML: {e}")))?;
+    let doc = roxmltree::Document::parse_with_options(&text, options).map_err(|e| {
+        let position = xml_position(&text, &e);
+        // roxmltree's own Display already appends "at line:column"; strip it so
+        // the location is reported once, in a structured form.
+        let message = e.to_string();
+        let message = match message.rsplit_once(" at ") {
+            Some((head, tail)) if tail.contains(':') && position.is_some() => head.to_string(),
+            _ => message,
+        };
+        AppError::MalformedXml(format!("input is not well-formed XML: {message}"), position)
+    })?;
 
     let root = doc.root_element();
     if root.tag_name().name() != "base" {

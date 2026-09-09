@@ -17,7 +17,7 @@ use catalog_diagram::render_html::{self, HtmlOptions, Variant};
 use catalog_diagram::render_svg::{self, Theme};
 use catalog_diagram::scene::{self, SceneOptions};
 use catalog_diagram::select::{self, ExternalRefs, SelectionSpec};
-use catalog_diagram::{inspect, parse, raster};
+use catalog_diagram::{export, inspect, parse, raster};
 
 const ABOUT: &str = "Render a 4D database catalog (structure XML) as an interactive HTML diagram, a standalone SVG, or a PNG.";
 
@@ -143,6 +143,11 @@ struct RenderArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     hide_system_fields: bool,
 
+    /// HTML only: always draw every field row instead of collapsing dense
+    /// tables behind a "Show N more" toggle.
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_collapse: bool,
+
     #[arg(long, value_enum, default_value_t = LayoutArg::AsDesigned)]
     layout: LayoutArg,
 
@@ -173,6 +178,10 @@ enum Format {
     Svg,
     Png,
     Html,
+    /// Mermaid `erDiagram` source.
+    Mmd,
+    /// Graphviz `digraph` source.
+    Dot,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -223,6 +232,7 @@ fn main() {
 
     let error_format = current_error_format(&cli);
     let quiet = current_quiet(&cli);
+    let input = current_input(&cli);
 
     match run(cli) {
         Ok(warnings) => {
@@ -233,7 +243,7 @@ fn main() {
         Err(err) => {
             match error_format {
                 ErrorFormat::Json => eprintln!("{}", err.to_json_line()),
-                ErrorFormat::Text => eprintln!("error: {err}"),
+                ErrorFormat::Text => eprintln!("{}", text_diagnostic(&err, input.as_deref())),
             }
             std::process::exit(err.exit_code() as i32);
         }
@@ -247,6 +257,61 @@ fn current_error_format(cli: &Cli) -> ErrorFormat {
         | Some(Command::Validate { global, .. }) => global.error_format,
         None => cli.global.error_format,
     }
+}
+
+/// How much of the offending source line to show either side of the caret.
+const EXCERPT_CONTEXT: usize = 60;
+
+fn current_input(cli: &Cli) -> Option<PathBuf> {
+    match &cli.command {
+        Some(Command::Render { input, .. })
+        | Some(Command::Inspect { input, .. })
+        | Some(Command::Validate { input, .. }) => Some(input.clone()),
+        None => cli.input.clone(),
+    }
+}
+
+/// Render an error for humans. Parse failures get a `rustc`-style location and
+/// a caret so the offending construct can be found in a file with thousands of
+/// lines.
+fn text_diagnostic(err: &AppError, input: Option<&Path>) -> String {
+    let mut out = format!("error: {err}");
+    let Some(position) = err.position() else {
+        return out;
+    };
+    let origin = match input {
+        Some(path) if path != Path::new("-") => path.display().to_string(),
+        _ => "<stdin>".to_string(),
+    };
+    out.push_str(&format!(
+        "\n  --> {origin}:{}:{}",
+        position.line, position.column
+    ));
+
+    // Catalogs are sometimes written on a single line, so window the excerpt
+    // around the column instead of dumping the whole thing.
+    let chars: Vec<char> = position.excerpt.replace('\t', " ").chars().collect();
+    let col = position.column.saturating_sub(1) as usize;
+    let start = col.saturating_sub(EXCERPT_CONTEXT);
+    let end = (col + EXCERPT_CONTEXT).min(chars.len());
+    if start >= end {
+        return out;
+    }
+    let mut excerpt: String = chars[start..end].iter().collect();
+    if start > 0 {
+        excerpt.insert(0, '…');
+    }
+    if end < chars.len() {
+        excerpt.push('…');
+    }
+
+    let gutter = position.line.to_string();
+    let pad = " ".repeat(gutter.len());
+    let caret_col = col - start + usize::from(start > 0);
+    out.push_str(&format!("\n{pad} |"));
+    out.push_str(&format!("\n{gutter} | {excerpt}"));
+    out.push_str(&format!("\n{pad} | {}^", " ".repeat(caret_col)));
+    out
 }
 
 fn current_quiet(cli: &Cli) -> bool {
@@ -373,10 +438,23 @@ fn do_render(input: &Path, args: &RenderArgs, global: &GlobalArgs) -> Result<Vec
         });
 
     let output = resolve_output(input, args)?;
+    let mut warnings = catalog.warnings.clone();
+    let mut note_fallback = |scene: &scene::Scene| {
+        if scene.layout_fallback && !warnings.iter().any(|w| w.starts_with("layout:")) {
+            warnings.push(format!(
+                "layout: fewer than {:.0}% of the selected tables have stored editor coordinates, \
+                 so the whole selection was laid out automatically",
+                scene::COORDINATE_COVERAGE_THRESHOLD * 100.0
+            ));
+        }
+    };
 
     let bytes: Vec<u8> = match args.format {
         Format::Html => {
             let variants = build_variants(&catalog, &selection, &title, args);
+            for variant in &variants {
+                note_fallback(&variant.scene);
+            }
             render_html::render(
                 &variants,
                 &HtmlOptions {
@@ -397,8 +475,12 @@ fn do_render(input: &Path, args: &RenderArgs, global: &GlobalArgs) -> Result<Vec
                     title,
                     layout,
                     hide_system_fields: args.hide_system_fields,
+                    // A still image cannot reveal collapsed rows, so never
+                    // collapse for SVG/PNG.
+                    collapse_dense_cards: false,
                 },
             );
+            note_fallback(&scene);
             render_svg::render(&scene, theme).into_bytes()
         }
         Format::Png => {
@@ -409,11 +491,17 @@ fn do_render(input: &Path, args: &RenderArgs, global: &GlobalArgs) -> Result<Vec
                     title,
                     layout,
                     hide_system_fields: args.hide_system_fields,
+                    // A still image cannot reveal collapsed rows, so never
+                    // collapse for SVG/PNG.
+                    collapse_dense_cards: false,
                 },
             );
+            note_fallback(&scene);
             let svg = render_svg::render(&scene, theme);
             raster::svg_to_png(&svg, args.scale)?
         }
+        Format::Mmd => export::mermaid(&catalog, &selection, args.hide_system_fields).into_bytes(),
+        Format::Dot => export::graphviz(&catalog, &selection, args.hide_system_fields).into_bytes(),
     };
 
     match &output {
@@ -443,7 +531,7 @@ fn do_render(input: &Path, args: &RenderArgs, global: &GlobalArgs) -> Result<Vec
         }
     }
 
-    Ok(catalog.warnings)
+    Ok(warnings)
 }
 
 /// Pre-build the layout / system-field variants the HTML toggles switch
@@ -491,6 +579,7 @@ fn build_variants(
                         title: title.to_string(),
                         layout,
                         hide_system_fields: hide,
+                        collapse_dense_cards: !args.no_collapse,
                     },
                 ),
             });
@@ -505,6 +594,8 @@ fn resolve_output(input: &Path, args: &RenderArgs) -> Result<Option<PathBuf>> {
         Format::Html => "html",
         Format::Svg => "svg",
         Format::Png => "png",
+        Format::Mmd => "mmd",
+        Format::Dot => "dot",
     };
     match &args.output {
         Some(path) if path == Path::new("-") => {

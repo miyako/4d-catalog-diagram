@@ -352,8 +352,30 @@ fn render_card(card: &Card) -> String {
         t = esc_text(&meta),
     );
 
-    for (index, row) in card.rows.iter().enumerate() {
+    // When the card is collapsed, the rows past the cut are still emitted (so
+    // the static export and the DOM stay complete) but live in a group that CSS
+    // hides. Expanding draws over the neighbours rather than reflowing, which
+    // keeps the card box — and therefore every edge anchor — exactly as laid
+    // out.
+    let cut = card.collapsed_rows.unwrap_or(card.rows.len());
+    if card.collapsed_rows.is_some() {
+        let _ = write!(
+            out,
+            r#"<rect class="card-expanded-bg" x="0" y="0" width="{w}" height="{h}" rx="9"/>"#,
+            w = n(card.w),
+            h = n(card.expanded_h),
+        );
+    }
+    for (index, row) in card.rows.iter().take(cut).enumerate() {
         out.push_str(&render_row(card, row, index));
+    }
+    if card.collapsed_rows.is_some() {
+        out.push_str(r#"<g class="card-extra-rows">"#);
+        for (index, row) in card.rows.iter().enumerate().skip(cut) {
+            out.push_str(&render_row(card, row, index));
+        }
+        out.push_str("</g>");
+        out.push_str(&render_more_toggle(card, cut));
     }
 
     let _ = write!(
@@ -362,7 +384,50 @@ fn render_card(card: &Card) -> String {
         w = n(card.w - 1.0),
         h = n(card.h - 1.0),
     );
+    if card.collapsed_rows.is_some() {
+        let _ = write!(
+            out,
+            r#"<rect class="card-outline card-expanded-outline" x="0.5" y="0.5" width="{w}" height="{h}" rx="9"/>"#,
+            w = n(card.w - 1.0),
+            h = n(card.expanded_h - 1.0),
+        );
+    }
 
+    out.push_str("</g>");
+    out
+}
+
+/// The "Show N more" / "Show less" affordance on a collapsed card. Both labels
+/// are pre-rendered and swapped with CSS so expanding needs no text measurement
+/// in the browser.
+fn render_more_toggle(card: &Card, cut: usize) -> String {
+    let hidden = card.rows.len().saturating_sub(cut);
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        r#"<g class="row-more" data-more="{hidden}" transform="translate(0 {y})"><title>{title}</title>"#,
+        y = n(HEADER_H + cut as f64 * ROW_H),
+        title = esc_text(&format!("{hidden} more field(s)")),
+    );
+    let _ = write!(
+        out,
+        r#"<rect class="row-more-bg" x="1" y="0" width="{w}" height="{h}"/>"#,
+        w = n(card.w - 2.0),
+        h = n(ROW_H),
+    );
+    let _ = write!(
+        out,
+        r#"<text class="row-more-label row-more-open" x="{x}" y="{y}" text-anchor="middle">{t}</text>"#,
+        x = n(card.w / 2.0),
+        y = n(ROW_H / 2.0 + 4.0),
+        t = esc_text(&format!("▾ Show {hidden} more")),
+    );
+    let _ = write!(
+        out,
+        r#"<text class="row-more-label row-more-close" x="{x}" y="{y}" text-anchor="middle">▴ Show less</text>"#,
+        x = n(card.w / 2.0),
+        y = n(ROW_H / 2.0 + 4.0),
+    );
     out.push_str("</g>");
     out
 }
@@ -489,7 +554,13 @@ pub fn static_css(palette: &Palette) -> String {
         .badge rect{{fill:{badge_bg}}}\
         .badge text{{fill:{badge_text}}}\
         .edge-label{{fill:{muted}}}\
-        .ghost-bg{{fill:{card};stroke:{border};stroke-dasharray:5 4}}",
+        .ghost-bg{{fill:{card};stroke:{border};stroke-dasharray:5 4}}\
+        .card-expanded-bg{{fill:none;display:none}}\
+        .card-expanded-outline{{fill:none;stroke:{border};display:none}}\
+        .row-more-bg{{fill:{row_alt}}}\
+        .row-more-label{{fill:{muted}}}\
+        .card-extra-rows{{display:none}}\
+        .row-more-close{{display:none}}",
         shared = shared_css(),
         bg = palette.bg,
         card = palette.card,
@@ -509,6 +580,7 @@ pub fn shared_css() -> String {
         .diagram-title{{font-size:{title}px;font-weight:700;letter-spacing:.2px}}\
         .card-title{{font-size:{title}px;font-weight:700}}\
         .card-meta{{font-size:{meta}px}}\
+        .row-more-label{{font-size:10.5px}}\
         .field-name{{font-size:{name}px}}\
         .ghost-name{{font-size:{title}px;font-weight:600}}\
         .field-type{{font-family:{mono};font-size:{type_size}px}}\

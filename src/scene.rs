@@ -18,6 +18,14 @@ pub const PAD_X: f64 = 11.0;
 pub const PAD_BOTTOM: f64 = 9.0;
 pub const GHOST_H: f64 = 36.0;
 
+/// A card with more than this many visible fields is rendered collapsed in the
+/// interactive HTML output.
+pub const COLLAPSE_MIN_FIELDS: usize = 10;
+/// How many field rows a collapsed card keeps on screen. The row freed up by
+/// collapsing carries the "Show N more" affordance, so a collapsed card is
+/// `COLLAPSE_VISIBLE_ROWS + 1` rows tall.
+pub const COLLAPSE_VISIBLE_ROWS: usize = 8;
+
 pub const NAME_SIZE: f64 = 12.0;
 pub const TYPE_SIZE: f64 = 10.0;
 pub const TITLE_SIZE: f64 = 13.0;
@@ -116,6 +124,14 @@ pub struct Card {
     pub hidden_field_count: usize,
     pub relation_count: usize,
     pub primary_key: Option<String>,
+    /// Number of rows kept visible when the card is collapsed. `None` means the
+    /// card shows every row, which is always the case for static SVG/PNG — a
+    /// still image has no way to reveal hidden rows.
+    pub collapsed_rows: Option<usize>,
+    /// Height the card needs once expanded. Equals `h` when not collapsed.
+    /// Expansion draws over neighbours instead of reflowing, so `h` — and
+    /// therefore every edge anchor — stays valid.
+    pub expanded_h: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +167,9 @@ pub struct Scene {
     pub height: f64,
     pub cards: Vec<Card>,
     pub edges: Vec<Edge>,
+    /// Set when `as-designed` was asked for but too few of the selected tables
+    /// carried editor coordinates, so the whole selection was auto-laid out.
+    pub layout_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +177,8 @@ pub struct SceneOptions {
     pub title: String,
     pub layout: LayoutMode,
     pub hide_system_fields: bool,
+    /// Collapse dense cards behind a "Show N more" toggle. HTML only.
+    pub collapse_dense_cards: bool,
 }
 
 /// Card geometry that does not depend on position, computed once and reused by
@@ -166,6 +187,28 @@ struct CardShape {
     size: Size,
     rows: Vec<Row>,
     coordinates: Option<Coordinates>,
+    collapsed_rows: Option<usize>,
+    expanded_h: f64,
+}
+
+/// Share of selected tables that must carry usable editor coordinates before
+/// `--layout as-designed` is honoured. Below this, mixing stored positions with
+/// auto-placed ones looks worse than laying the whole selection out
+/// automatically, so we do the latter.
+pub const COORDINATE_COVERAGE_THRESHOLD: f64 = 0.8;
+
+/// Fraction of `coords` that carry coordinates, counting real tables only —
+/// ghost cards never have any and would drag the ratio down artificially.
+fn coordinate_coverage(coords: &[Option<Coordinates>], table_count: usize) -> f64 {
+    if table_count == 0 {
+        return 1.0;
+    }
+    let with = coords
+        .iter()
+        .take(table_count)
+        .filter(|c| c.is_some())
+        .count();
+    with as f64 / table_count as f64
 }
 
 pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -> Scene {
@@ -176,6 +219,7 @@ pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -
             catalog,
             table_index,
             options.hide_system_fields,
+            options.collapse_dense_cards,
         ));
     }
     for name in &selection.ghosts {
@@ -191,7 +235,16 @@ pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -
         .map(|r| (card_index(selection, r.from), card_index(selection, r.to)))
         .collect();
 
-    let mut positions = match options.layout {
+    let coverage = coordinate_coverage(&coords, selection.tables.len());
+    let layout_fallback =
+        options.layout == LayoutMode::AsDesigned && coverage < COORDINATE_COVERAGE_THRESHOLD;
+    let effective_layout = if layout_fallback {
+        LayoutMode::Auto
+    } else {
+        options.layout
+    };
+
+    let mut positions = match effective_layout {
         LayoutMode::AsDesigned => layout::as_designed(&coords, &sizes),
         LayoutMode::Auto => layout::auto(&sizes, &edge_pairs),
     };
@@ -223,6 +276,8 @@ pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -
                 hidden_field_count: 0,
                 relation_count: 0,
                 primary_key: None,
+                collapsed_rows: None,
+                expanded_h: layout::round2(shape.size.h),
             });
         } else {
             let table = &catalog.tables[selection.tables[i]];
@@ -251,6 +306,8 @@ pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -
                 relation_count: catalog.relations_in(&table.name)
                     + catalog.relations_out(&table.name),
                 primary_key: table.primary_key.clone(),
+                collapsed_rows: shape.collapsed_rows,
+                expanded_h: layout::round2(shape.expanded_h),
             });
         }
     }
@@ -259,12 +316,13 @@ pub fn build(catalog: &Catalog, selection: &Selection, options: &SceneOptions) -
 
     Scene {
         title: options.title.clone(),
-        layout: options.layout.as_str(),
+        layout: effective_layout.as_str(),
         hide_system_fields: options.hide_system_fields,
         width,
         height,
         cards,
         edges,
+        layout_fallback,
     }
 }
 
@@ -283,12 +341,19 @@ fn shape_for_ghost(name: &str) -> CardShape {
             w: layout::round2(width),
             h: GHOST_H,
         },
+        collapsed_rows: None,
+        expanded_h: GHOST_H,
         rows: Vec::new(),
         coordinates: None,
     }
 }
 
-fn shape_for_table(catalog: &Catalog, table_index: usize, hide_system: bool) -> CardShape {
+fn shape_for_table(
+    catalog: &Catalog,
+    table_index: usize,
+    hide_system: bool,
+    collapse: bool,
+) -> CardShape {
     let table = &catalog.tables[table_index];
     let visible: Vec<(usize, &crate::model::Field)> = table.visible_fields(hide_system).collect();
 
@@ -324,7 +389,20 @@ fn shape_for_table(catalog: &Catalog, table_index: usize, hide_system: bool) -> 
     }
 
     let width = layout::round2(content_need.clamp(MIN_CARD_W, MAX_CARD_W));
-    let height = HEADER_H + visible.len() as f64 * ROW_H + PAD_BOTTOM;
+    let collapsed_rows = if collapse && visible.len() > COLLAPSE_MIN_FIELDS {
+        Some(COLLAPSE_VISIBLE_ROWS)
+    } else {
+        None
+    };
+    // The toggle row sits at a fixed offset immediately below the kept rows and
+    // the remaining rows are pushed one row further down, so expanding never
+    // has to move anything.
+    let toggle_row = usize::from(collapsed_rows.is_some());
+    let expanded_h = HEADER_H + (visible.len() + toggle_row) as f64 * ROW_H + PAD_BOTTOM;
+    let height = match collapsed_rows {
+        Some(keep) => HEADER_H + (keep + 1) as f64 * ROW_H + PAD_BOTTOM,
+        None => expanded_h,
+    };
 
     // Reserve horizontal room for the type badge and status badges, then give
     // whatever is left to the field name.
@@ -349,7 +427,11 @@ fn shape_for_table(catalog: &Catalog, table_index: usize, hide_system: bool) -> 
                 - badge_w;
             Row {
                 field_index: *field_index,
-                y: layout::round2(HEADER_H + n as f64 * ROW_H),
+                y: layout::round2(
+                    HEADER_H
+                        + (n + usize::from(collapsed_rows.is_some_and(|keep| n >= keep))) as f64
+                            * ROW_H,
+                ),
                 name: field.name.clone(),
                 display_name: fonts::ellipsize(
                     &field.name,
@@ -374,6 +456,8 @@ fn shape_for_table(catalog: &Catalog, table_index: usize, hide_system: bool) -> 
         },
         rows,
         coordinates: table.coordinates,
+        collapsed_rows,
+        expanded_h: layout::round2(expanded_h),
     }
 }
 
@@ -590,6 +674,7 @@ mod tests {
                     title: "t".into(),
                     layout: mode,
                     hide_system_fields: false,
+                    collapse_dense_cards: false,
                 },
             );
             for i in 0..scene.cards.len() {
@@ -617,6 +702,7 @@ mod tests {
                 title: "t".into(),
                 layout: LayoutMode::AsDesigned,
                 hide_system_fields: false,
+                collapse_dense_cards: false,
             },
         );
         for card in &scene.cards {
@@ -632,6 +718,7 @@ mod tests {
             title: "t".into(),
             layout: LayoutMode::AsDesigned,
             hide_system_fields: hide,
+            collapse_dense_cards: false,
         };
         let shown = build(&catalog, &selection, &options(false));
         let hidden = build(&catalog, &selection, &options(true));

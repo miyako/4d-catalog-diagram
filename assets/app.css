@@ -290,6 +290,50 @@ body {
 .scene.has-query .card.is-match { opacity: 1; }
 .scene.has-query .card.is-match .card-outline { stroke: var(--focus); stroke-width: 2; }
 
+/* ------------------------------------------ progressive disclosure (dense) */
+
+.card-expanded-bg, .card-expanded-outline, .card-extra-rows { display: none; }
+.card-expanded-bg { fill: var(--card); }
+.card-expanded-outline { fill: none; stroke: var(--card-border); }
+.row-more { cursor: pointer; }
+.row-more-bg { fill: var(--row-alt); }
+.row-more-label { fill: var(--muted); font-size: 10.5px; text-anchor: middle; }
+.row-more:hover .row-more-label { fill: var(--focus); }
+.row-more-close { display: none; }
+
+/* Expanding draws over the neighbours; the card box itself never changes, so
+   every edge stays anchored where the layout put it. */
+.card.is-expanded .card-expanded-bg,
+.card.is-expanded .card-expanded-outline,
+.card.is-expanded .card-extra-rows { display: inline; }
+.card.is-expanded .card-bg,
+.card.is-expanded .card-outline:not(.card-expanded-outline) { display: none; }
+.card.is-expanded .row-more-open { display: none; }
+.card.is-expanded .row-more-close { display: inline; }
+
+/* ---------------------------------------------------------- field highlight */
+
+.row.is-field-target .row-bg { fill: var(--focus); fill-opacity: .18; }
+.row.is-field-target .field-name { font-weight: 700; }
+
+/* ------------------------------------------------------------------ minimap */
+
+#minimap {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  touch-action: none;
+}
+#minimap[hidden] { display: none; }
+#minimap .mm-card { fill: var(--muted); fill-opacity: .55; }
+#minimap .mm-card.is-selected { fill: var(--focus); fill-opacity: .9; }
+#minimap .mm-view { fill: var(--focus); fill-opacity: .12; stroke: var(--focus); stroke-width: 1; }
+
 @media print {
-  #sidebar, #toolbar, #popup { display: none; }
+  #sidebar, #toolbar, #popup, #minimap { display: none; }
 }

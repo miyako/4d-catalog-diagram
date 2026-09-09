@@ -12,6 +12,14 @@
   var popup = document.getElementById("popup");
   var search = document.getElementById("search");
   var list = document.getElementById("table-list");
+  var minimap = document.getElementById("minimap");
+  var minimapCards = document.getElementById("minimap-cards");
+  var minimapView = document.getElementById("minimap-view");
+
+  /* Below this many tables a minimap is clutter rather than navigation. */
+  var MINIMAP_MIN_CARDS = 16;
+  var MINIMAP_W = 180;
+  var MINIMAP_H = 120;
 
   var state = { x: 0, y: 0, k: 1, layout: data.default.layout, hide: data.default.hide_system_fields };
 
@@ -31,6 +39,7 @@
       "transform",
       "translate(" + state.x.toFixed(2) + " " + state.y.toFixed(2) + ") scale(" + state.k.toFixed(4) + ")"
     );
+    updateMinimapView();
   }
 
   function sizeCanvas() {
@@ -87,6 +96,11 @@
       el.classList.remove("is-selected", "is-related");
     });
     list.querySelectorAll(".is-selected").forEach(function (el) { el.classList.remove("is-selected"); });
+    scene.querySelectorAll(".is-field-target").forEach(function (el) { el.classList.remove("is-field-target"); });
+    // An expanded card draws over its neighbours, so it must not outlive the
+    // selection that justified it.
+    scene.querySelectorAll(".card.is-expanded").forEach(function (el) { el.classList.remove("is-expanded"); });
+    minimapCards.querySelectorAll(".is-selected").forEach(function (el) { el.classList.remove("is-selected"); });
     popup.hidden = true;
   }
 
@@ -111,7 +125,72 @@
       item.classList.add("is-selected");
       item.scrollIntoView({ block: "nearest" });
     }
+    var pip = minimapCards.querySelector('[data-table="' + cssEscape(name) + '"]');
+    if (pip) pip.classList.add("is-selected");
     return card;
+  }
+
+  /* --------------------------------------------------------- deep linking */
+
+  /* `file.html#CLIENTS` centres on a table; `file.html#CLIENTS.ID` also
+   * highlights one field. Purely client-side, so it works from file://. */
+  function parseHash(hash) {
+    var raw = String(hash || "").replace(/^#/, "");
+    if (!raw) return null;
+    try { raw = decodeURIComponent(raw); } catch (e) { /* keep the raw form */ }
+    var dot = raw.indexOf(".");
+    if (dot === -1) return { table: raw, field: null };
+    return { table: raw.slice(0, dot), field: raw.slice(dot + 1) };
+  }
+
+  var suppressHashChange = false;
+
+  function writeHash(table, field) {
+    var next = table ? "#" + encodeURIComponent(table) + (field ? "." + encodeURIComponent(field) : "") : "";
+    var url = location.pathname + location.search + next;
+    if (location.hash === next || (!next && !location.hash)) return;
+    suppressHashChange = true;
+    if (history.replaceState) history.replaceState(null, "", url);
+    else location.hash = next;
+    setTimeout(function () { suppressHashChange = false; }, 0);
+  }
+
+  function applyHash() {
+    var target = parseHash(location.hash);
+    if (!target) return false;
+    var card = selectTable(target.table);
+    if (!card) return false;
+    revealField(card, target.field);
+    centerOn(card);
+    return true;
+  }
+
+  function revealField(card, field) {
+    if (!field) return;
+    var row = card.querySelector('.row[data-field="' + cssEscape(field) + '"]');
+    if (!row) return;
+    // The field may be behind the "Show N more" cut.
+    if (card.contains(row) && row.closest(".card-extra-rows")) expandCard(card, true);
+    row.classList.add("is-field-target");
+  }
+
+  /* ------------------------------------------------ progressive disclosure */
+
+  function expandCard(card, expand) {
+    var scene = activeScene();
+    if (!scene) return;
+    if (expand) {
+      // Only one card at a time, since an expanded card draws over its
+      // neighbours rather than pushing them aside.
+      scene.querySelectorAll(".card.is-expanded").forEach(function (other) {
+        if (other !== card) other.classList.remove("is-expanded");
+      });
+      card.classList.add("is-expanded");
+      // SVG has no z-index: raise the card by making it the last sibling.
+      card.parentNode.appendChild(card);
+    } else {
+      card.classList.remove("is-expanded");
+    }
   }
 
   function cssEscape(value) {
@@ -178,10 +257,22 @@
       showRelation(edge, event);
       return;
     }
+    var more = event.target.closest(".row-more");
+    if (more) {
+      event.stopPropagation();
+      var owner = more.closest(".card");
+      expandCard(owner, !owner.classList.contains("is-expanded"));
+      return;
+    }
     var card = event.target.closest(".card");
     if (card) {
       event.stopPropagation();
-      selectTable(card.getAttribute("data-table"));
+      var name = card.getAttribute("data-table");
+      var row = event.target.closest(".row");
+      var field = row ? row.getAttribute("data-field") : null;
+      var selected = selectTable(name);
+      if (selected) revealField(selected, field);
+      writeHash(name, field);
       return;
     }
     dragging = true;
@@ -189,6 +280,7 @@
     canvas.classList.add("is-panning");
     canvas.setPointerCapture(event.pointerId);
     clearSelection();
+    writeHash(null, null);
   });
 
   canvas.addEventListener("pointermove", function (event) {
@@ -224,8 +316,12 @@
   list.addEventListener("click", function (event) {
     var button = event.target.closest(".table-item");
     if (!button) return;
-    var card = selectTable(button.getAttribute("data-target"));
-    if (card) centerOn(card);
+    var name = button.getAttribute("data-target");
+    var card = selectTable(name);
+    if (card) {
+      centerOn(card);
+      writeHash(name, null);
+    }
   });
 
   search.addEventListener("input", function () {
@@ -258,12 +354,92 @@
     var next = sceneFor(state.layout, state.hide);
     if (!next) return;
     clearSelection();
+    canvas.querySelectorAll(".card.is-expanded").forEach(function (card) {
+      card.classList.remove("is-expanded");
+    });
     canvas.querySelectorAll(".scene").forEach(function (scene) {
       scene.classList.toggle("scene-active", scene === next);
     });
     search.dispatchEvent(new Event("input"));
+    buildMinimap();
     fit();
+    applyHash();
   }
+
+  /* ------------------------------------------------------------- minimap */
+
+  var minimapScale = 0;
+
+  function buildMinimap() {
+    var scene = activeScene();
+    minimapCards.textContent = "";
+    if (!scene) return;
+    var cards = scene.querySelectorAll(".card");
+    if (cards.length < MINIMAP_MIN_CARDS) {
+      minimap.hidden = true;
+      return;
+    }
+    var w = parseFloat(scene.getAttribute("data-width"));
+    var h = parseFloat(scene.getAttribute("data-height"));
+    minimapScale = Math.min(MINIMAP_W / w, MINIMAP_H / h);
+    cards.forEach(function (card) {
+      var match = /translate\(\s*(-?[\d.]+)[ ,]+(-?[\d.]+)\s*\)/.exec(card.getAttribute("transform") || "");
+      if (!match) return;
+      var box = card.querySelector(".card-bg, .ghost-bg");
+      if (!box) return;
+      var pip = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      pip.setAttribute("class", "mm-card");
+      pip.setAttribute("data-table", card.getAttribute("data-table"));
+      pip.setAttribute("x", (parseFloat(match[1]) * minimapScale).toFixed(2));
+      pip.setAttribute("y", (parseFloat(match[2]) * minimapScale).toFixed(2));
+      pip.setAttribute("width", Math.max(1, parseFloat(box.getAttribute("width")) * minimapScale).toFixed(2));
+      pip.setAttribute("height", Math.max(1, parseFloat(box.getAttribute("height")) * minimapScale).toFixed(2));
+      minimapCards.appendChild(pip);
+    });
+    minimap.hidden = false;
+    updateMinimapView();
+  }
+
+  function updateMinimapView() {
+    if (minimap.hidden || !minimapScale) return;
+    var rect = stage.getBoundingClientRect();
+    // Diagram-space rectangle currently on screen, mapped into minimap space.
+    var ratio = minimapScale / state.k;
+    minimapView.setAttribute("x", (-state.x * ratio).toFixed(2));
+    minimapView.setAttribute("y", (-state.y * ratio).toFixed(2));
+    minimapView.setAttribute("width", Math.max(2, rect.width * ratio).toFixed(2));
+    minimapView.setAttribute("height", Math.max(2, rect.height * ratio).toFixed(2));
+  }
+
+  function minimapPanTo(event) {
+    if (!minimapScale) return;
+    var box = minimap.getBoundingClientRect();
+    var rect = stage.getBoundingClientRect();
+    var dx = (event.clientX - box.left) / minimapScale;
+    var dy = (event.clientY - box.top) / minimapScale;
+    state.x = rect.width / 2 - dx * state.k;
+    state.y = rect.height / 2 - dy * state.k;
+    applyTransform();
+  }
+
+  var minimapDragging = false;
+  minimap.addEventListener("pointerdown", function (event) {
+    event.preventDefault();
+    minimapDragging = true;
+    try { minimap.setPointerCapture(event.pointerId); } catch (e) { /* no capture, still drags */ }
+    minimapPanTo(event);
+  });
+  minimap.addEventListener("pointermove", function (event) {
+    if (minimapDragging) minimapPanTo(event);
+  });
+  ["pointerup", "pointercancel"].forEach(function (type) {
+    minimap.addEventListener(type, function () { minimapDragging = false; });
+  });
+
+  window.addEventListener("hashchange", function () {
+    if (suppressHashChange) return;
+    applyHash();
+  });
 
   var toggleSystem = document.getElementById("toggle-system");
   if (toggleSystem && !toggleSystem.disabled) {
@@ -298,8 +474,8 @@
     var css = toggleTheme.checked ? data.css.dark : data.css.light;
     var clone = scene.cloneNode(true);
     clone.removeAttribute("class");
-    clone.querySelectorAll(".is-selected, .is-related, .is-match").forEach(function (el) {
-      el.classList.remove("is-selected", "is-related", "is-match");
+    clone.querySelectorAll(".is-selected, .is-related, .is-match, .is-field-target").forEach(function (el) {
+      el.classList.remove("is-selected", "is-related", "is-match", "is-field-target");
     });
     return (
       '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + " " + h + '">' +
@@ -360,5 +536,7 @@
   });
 
   sizeCanvas();
+  buildMinimap();
   fit();
+  applyHash();
 })();

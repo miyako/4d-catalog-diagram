@@ -5,6 +5,7 @@
 //! `parse` → `select` → `layout` → `render_svg` / `render_html` / `raster`.
 
 pub mod error;
+pub mod export;
 pub mod fonts;
 pub mod inspect;
 pub mod layout;

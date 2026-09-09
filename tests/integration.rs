@@ -45,6 +45,7 @@ fn render(catalog: &Catalog, selection: &Selection, layout: LayoutMode, hide: bo
             title: catalog.base_name.clone(),
             layout,
             hide_system_fields: hide,
+            collapse_dense_cards: false,
         },
     );
     render_svg::render(&scene, Theme::Light)
@@ -318,6 +319,7 @@ fn hostile_table_names_cannot_produce_script_or_broken_markup() {
             title: catalog.base_name.clone(),
             layout: LayoutMode::AsDesigned,
             hide_system_fields: false,
+            collapse_dense_cards: false,
         },
     );
     let html = catalog_diagram::render_html::render(
@@ -506,4 +508,322 @@ fn cli_render_is_reproducible_across_processes() {
     }
     assert_eq!(outputs[0], outputs[1], "two runs produced different bytes");
     assert!(!outputs[0].is_empty());
+}
+
+// ------------------------------------------------- text export formats
+
+/// Mermaid is whitespace- and keyword-sensitive; assert the exact structural
+/// shape rather than just "contains erDiagram". CI cannot run the real Mermaid
+/// grammar without pulling in a browser, so this is a strict structural proxy —
+/// the output was additionally checked against mermaid's own `parse()` and
+/// against Graphviz during development.
+#[test]
+fn mermaid_output_is_structurally_valid() {
+    let catalog = invoices();
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let mmd = catalog_diagram::export::mermaid(&catalog, &selection, false);
+
+    let mut lines = mmd.lines();
+    assert_eq!(lines.next(), Some("erDiagram"));
+
+    let entity = regex_lite_entities(&mmd);
+    assert!(entity.contains(&"CLIENTS".to_string()));
+    assert!(entity.contains(&"INVOICE_LINES".to_string()));
+
+    let mut depth = 0usize;
+    let mut relations = 0usize;
+    for line in mmd.lines().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if depth == 0 {
+            if let Some(name) = trimmed.strip_suffix(" {") {
+                assert!(is_safe_identifier(name), "entity name {name:?} is not safe");
+                depth = 1;
+                continue;
+            }
+            // The only other top-level construct is a relationship line.
+            let (lhs, rest) = trimmed.split_once(" ||--o{ ").expect("relationship line");
+            let (rhs, label) = rest.split_once(" : ").expect("relationship label");
+            assert!(is_safe_identifier(lhs));
+            assert!(is_safe_identifier(rhs));
+            assert!(label.starts_with('"') && label.ends_with('"'));
+            assert_eq!(
+                label.matches('"').count(),
+                2,
+                "unescaped quote in {label:?}"
+            );
+            relations += 1;
+        } else if trimmed == "}" {
+            depth = 0;
+        } else {
+            // `type name` or `type name PK`
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            assert!(
+                parts.len() == 2 || parts.len() == 3,
+                "bad attribute line {trimmed:?}"
+            );
+            assert!(parts.iter().all(|p| is_safe_identifier(p)));
+            if parts.len() == 3 {
+                assert!(matches!(parts[2], "PK" | "UK" | "FK"));
+            }
+        }
+    }
+    assert_eq!(depth, 0, "unbalanced entity block");
+    assert_eq!(relations, selection.relations.len());
+}
+
+fn is_safe_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !value.starts_with(|c: char| c.is_ascii_digit())
+}
+
+fn regex_lite_entities(mmd: &str) -> Vec<String> {
+    mmd.lines()
+        .filter_map(|l| l.trim().strip_suffix(" {").map(|s| s.to_string()))
+        .collect()
+}
+
+#[test]
+fn graphviz_output_is_balanced_and_escaped() {
+    let catalog = invoices();
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let dot = catalog_diagram::export::graphviz(&catalog, &selection, false);
+
+    assert!(dot.starts_with("digraph catalog {\n"));
+    assert!(dot.trim_end().ends_with('}'));
+    assert!(dot.contains("rankdir=LR;"));
+    assert!(dot.contains("shape=record"));
+    // Ports let an edge attach to the field that carries the relation.
+    assert!(dot.contains("INVOICE_LINES:f1"));
+
+    for line in dot.lines() {
+        assert_eq!(
+            line.matches('"').count() - line.matches("\\\"").count() * 2,
+            line.matches('"').count() - line.matches("\\\"").count() * 2,
+        );
+        assert!(!line.contains("\u{0}"));
+    }
+}
+
+/// Hostile names must not be able to break out of either grammar.
+#[test]
+fn text_exports_neutralize_hostile_names() {
+    let catalog =
+        parse::parse_bytes(&std::fs::read(fixture_path("tests/fixtures/hostile.xml")).unwrap())
+            .unwrap();
+    let selection = select::select(&catalog, &spec()).unwrap();
+
+    let mmd = catalog_diagram::export::mermaid(&catalog, &selection, false);
+    // Nothing that could close an enclosing HTML context or a Mermaid string
+    // may survive into the output.
+    assert!(!mmd.contains('<'), "{mmd}");
+    assert!(!mmd.contains('>'), "{mmd}");
+    for line in mmd.lines() {
+        assert!(
+            line.matches('"').count() % 2 == 0,
+            "odd quoting in {line:?}"
+        );
+    }
+
+    let dot = catalog_diagram::export::graphviz(&catalog, &selection, false);
+    for line in dot.lines() {
+        // Drop every backslash escape, then whatever metacharacters remain must
+        // be Graphviz's own syntax rather than something a catalog name smuggled
+        // in. Unbalanced quotes are the actual breakout risk.
+        let bare = strip_escapes(line);
+        assert_eq!(
+            bare.matches('"').count() % 2,
+            0,
+            "unbalanced quoting in {line:?}"
+        );
+        for segment in bare.split('"').skip(1).step_by(2) {
+            // Inside a quoted label only record structure may survive.
+            for part in segment.split(['{', '}', '|']) {
+                let ports: Vec<&str> = part.match_indices('<').map(|(_, s)| s).collect();
+                assert!(
+                    ports.len() == part.matches('>').count(),
+                    "stray angle bracket in {part:?}"
+                );
+            }
+        }
+    }
+}
+
+fn strip_escapes(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn cli_writes_mmd_and_dot() {
+    let dir = std::env::temp_dir().join(format!("catviz-text-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (format, extension, needle) in [("mmd", "mmd", "erDiagram"), ("dot", "dot", "digraph")] {
+        let out = dir.join(format!("out.{extension}"));
+        let status = bin()
+            .arg(fixture_path("references/InvoicesDemo.xml"))
+            .args(["-f", format, "-o"])
+            .arg(&out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains(needle), "{format} output missing {needle}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --------------------------------------------------- layout coverage rule
+
+#[test]
+fn low_coordinate_coverage_falls_back_to_auto_layout() {
+    let mut catalog = invoices();
+    // Strip coordinates from all but one table: 1/5 = 20% < 80%.
+    for table in catalog.tables.iter_mut().skip(1) {
+        table.coordinates = None;
+    }
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let scene = scene::build(
+        &catalog,
+        &selection,
+        &SceneOptions {
+            title: "t".into(),
+            layout: LayoutMode::AsDesigned,
+            hide_system_fields: false,
+            collapse_dense_cards: false,
+        },
+    );
+    assert!(scene.layout_fallback);
+    assert_eq!(scene.layout, "auto");
+}
+
+#[test]
+fn high_coordinate_coverage_keeps_the_designed_layout() {
+    let mut catalog = invoices();
+    // 4/5 = exactly the 80% threshold, which must still count as covered.
+    catalog.tables[4].coordinates = None;
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let scene = scene::build(
+        &catalog,
+        &selection,
+        &SceneOptions {
+            title: "t".into(),
+            layout: LayoutMode::AsDesigned,
+            hide_system_fields: false,
+            collapse_dense_cards: false,
+        },
+    );
+    assert!(!scene.layout_fallback);
+    assert_eq!(scene.layout, "as-designed");
+}
+
+// ------------------------------------------------- progressive disclosure
+
+#[test]
+fn dense_cards_collapse_only_when_asked() {
+    let catalog = invoices();
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let options = |collapse| SceneOptions {
+        title: "t".into(),
+        layout: LayoutMode::AsDesigned,
+        hide_system_fields: false,
+        collapse_dense_cards: collapse,
+    };
+
+    let full = scene::build(&catalog, &selection, &options(false));
+    let collapsed = scene::build(&catalog, &selection, &options(true));
+
+    for (a, b) in full.cards.iter().zip(collapsed.cards.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.rows.len(), b.rows.len(), "no field may be dropped");
+        assert!(a.collapsed_rows.is_none());
+        if b.rows.len() > scene::COLLAPSE_MIN_FIELDS {
+            assert_eq!(b.collapsed_rows, Some(scene::COLLAPSE_VISIBLE_ROWS));
+            assert!(b.h < b.expanded_h, "collapsed card must be shorter");
+            assert!(b.h < a.h);
+        } else {
+            assert_eq!(b.collapsed_rows, None);
+            assert_eq!(b.h, b.expanded_h);
+        }
+    }
+}
+
+#[test]
+fn static_svg_never_collapses() {
+    let out = bin()
+        .arg(fixture_path("references/InvoicesDemo.xml"))
+        .args(["-f", "svg", "-o", "-"])
+        .output()
+        .unwrap();
+    let svg = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !svg.contains(r#"class="row-more""#),
+        "a still image cannot expand rows"
+    );
+    assert!(
+        !svg.contains("Show "),
+        "no disclosure affordance in static output"
+    );
+    assert!(svg.contains("Optional_Data"), "every field must be drawn");
+}
+
+// ------------------------------------------------------ parse diagnostics
+
+#[test]
+fn malformed_xml_reports_line_and_column() {
+    let dir = std::env::temp_dir().join(format!("catviz-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bad.xml");
+    std::fs::write(
+        &path,
+        "<?xml version=\"1.0\"?>\n<base>\n  <table name=\"A\">\n    <field 1name=\"x\"/>\n  </table>\n</base>\n",
+    )
+    .unwrap();
+
+    let text = bin().arg("validate").arg(&path).output().unwrap();
+    assert_eq!(text.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(stderr.contains("bad.xml:4:"), "missing location: {stderr}");
+    assert!(stderr.contains('^'), "missing caret: {stderr}");
+
+    let json = bin()
+        .arg("validate")
+        .arg(&path)
+        .args(["--error-format", "json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(json.stderr.split(|&b| b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(value["kind"], "malformed_xml");
+    assert_eq!(value["line"], 4);
+    assert!(value["column"].as_u64().unwrap() > 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------------ deep links
+
+#[test]
+fn html_ships_the_deep_link_and_minimap_machinery() {
+    let out = bin()
+        .arg(fixture_path("references/InvoicesDemo.xml"))
+        .args(["-f", "html", "-o", "-"])
+        .output()
+        .unwrap();
+    let html = String::from_utf8(out.stdout).unwrap();
+    assert!(html.contains(r#"id="minimap""#));
+    assert!(html.contains("hashchange"));
+    assert!(html.contains("function applyHash"));
+    // Rows must be addressable by field name for `#TABLE.FIELD` to work.
+    assert!(html.contains(r#"data-field="Invoice_Number""#));
 }

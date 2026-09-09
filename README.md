@@ -28,11 +28,30 @@ chmod +x 4d-catalog-diagram
 Releases are published for macOS, Linux and Windows on both x64 and arm64.
 Every asset is a `.tar.xz` containing the binary, the README and the licence.
 
-On macOS, Gatekeeper quarantines downloaded binaries. Clear it with:
+### macOS: clearing the quarantine flag
+
+The release binaries are **not code-signed or notarized**. Anything downloaded
+through a browser or `curl` is tagged with `com.apple.quarantine`, and macOS
+refuses to run it — usually with a dialog along the lines of *"4d-catalog-diagram"
+cannot be opened because the developer cannot be verified*, or a bare
+`zsh: killed`. Nothing is wrong with the binary; the flag is.
+
+Remove it once, after unpacking:
 
 ```sh
-xattr -d com.apple.quarantine 4d-catalog-diagram
+xattr -d com.apple.quarantine ./4d-catalog-diagram
 ```
+
+If `xattr` reports that the attribute is missing, the file was never
+quarantined and there is nothing to do. To check first:
+
+```sh
+xattr -p com.apple.quarantine ./4d-catalog-diagram
+```
+
+You will not hit this if you build from source, or if you install the copy
+published by [`miyako/skills`](https://github.com/miyako/skills), whose release
+pipeline signs and notarizes the macOS binaries.
 
 Or build from source with a Rust toolchain:
 
@@ -101,7 +120,7 @@ cat structure.xml | 4d-catalog-diagram render - -f svg -o - > structure.svg
 | Option | Meaning |
 | --- | --- |
 | `-o, --output <PATH>` | Output file. Defaults to `<input-stem>.<ext>` next to the input. `-` writes SVG/HTML to stdout. |
-| `-f, --format <svg\|png\|html>` | Output format. Default `html`. |
+| `-f, --format <svg\|png\|html\|mmd\|dot>` | Output format. Default `html`. |
 | `--tables <CSV>` | Explicit table allow-list. |
 | `--tables-match <REGEX>` | Regex allow-list over table names. |
 | `--focus <TABLE>` | Centre a neighbourhood selection on one table. |
@@ -109,6 +128,7 @@ cat structure.xml | 4d-catalog-diagram render - -f svg -o - > structure.svg
 | `--depth <N>` | Hop count for `--focus`/`--field`. Default `1`. |
 | `--external-refs <ghost\|hide\|include>` | What to do with tables just outside the selection. Default `ghost`. |
 | `--hide-system-fields` | Drop 4D-internal (`visible="false"`) fields entirely. |
+| `--no-collapse` | HTML only: always draw every field row instead of collapsing dense tables. |
 | `--layout <as-designed\|auto>` | Default `as-designed`. |
 | `--theme <light\|dark\|auto>` | Default `auto` for HTML, `light` for SVG/PNG. |
 | `--title <STRING>` | Override the displayed diagram title. |
@@ -117,6 +137,30 @@ cat structure.xml | 4d-catalog-diagram render - -f svg -o - > structure.svg
 | `--embed-timestamp` | Embed a generation timestamp. Off by default because it breaks reproducibility. |
 | `--error-format <text\|json>` | `json` writes one diagnostic object per line to stderr. |
 | `-q, --quiet` | Suppress non-error chatter. |
+
+### Text formats
+
+`--format mmd` and `--format dot` skip layout and rasterization entirely and
+emit source for another tool to lay out:
+
+```sh
+4d-catalog-diagram catalog.xml -f mmd -o - >> notes.md
+4d-catalog-diagram catalog.xml -f dot -o - | dot -Tsvg > catalog.svg
+```
+
+`mmd` is a Mermaid `erDiagram`: one entity per table, `PK`/`UK` markers on key
+fields, and a `||--o{` line per relation. It pastes straight into a Markdown
+file that GitHub, GitLab or Obsidian will render.
+
+`dot` is a Graphviz `digraph` with `rankdir=LR` and record-shaped nodes. Every
+field gets a port, so relation edges attach to the field that actually carries
+the join rather than to the middle of the box.
+
+Both grammars are far stricter about identifiers than 4D is about object names,
+so table, field and type names are reduced to `[A-Za-z0-9_]` (uniquely — two
+names that would collide get a numeric suffix) and relation labels are stripped
+of anything that could terminate a string. `--layout`, `--theme` and `--scale`
+have no effect on these formats.
 
 ### Layout
 
@@ -128,6 +172,14 @@ boxes that would clip real field names. Positions are rescaled by the median
 size ratio so the designer's relative spacing survives the larger cards, and
 any table without stored coordinates is parked in free space below the ones
 that have them.
+
+That only holds while *most* of the selection has coordinates. If fewer than
+**80%** of the selected tables carry usable positions, mixing stored and
+invented placements looks worse than not using the stored ones at all, so the
+whole selection falls back to `auto` and a warning is written to stderr. The
+threshold is `COORDINATE_COVERAGE_THRESHOLD` in `src/scene.rs`. Ghost tables
+(references to tables outside the selection) never have coordinates and are
+excluded from the calculation.
 
 `--layout auto` ignores stored positions and runs a deterministic
 force-directed layout instead. Useful when the catalog was never arranged by
@@ -145,6 +197,20 @@ re-running the CLI.
 - Click a connector for the relation's details: both relation names, integrity
   rule and auto-load flags.
 - `/` focuses the filter box; `Esc` clears the selection.
+- Tables with more than 10 fields are collapsed to the first 8 with a
+  *Show N more* toggle. Expanding draws over the neighbouring cards rather than
+  reflowing the diagram, so the layout and every connector stay put, and only
+  one card is expanded at a time. Pass `--no-collapse` to switch this off.
+  Static `svg`/`png` output is never collapsed — a still image has no way to
+  reveal a hidden row.
+- Deep links work offline: `out.html#CLIENTS` selects and centres on that table,
+  and `out.html#CLIENTS.ID` additionally highlights that one field, expanding
+  the card first if the field is behind the *Show N more* cut. Clicking a table
+  or a field updates the fragment, so the address bar is always a shareable
+  link to what you are looking at.
+- Diagrams with 16 or more tables get a minimap in the bottom-right corner;
+  click or drag it to pan. Smaller diagrams don't, because there it would be
+  clutter rather than navigation.
 - Export the current view as SVG or PNG straight from the page.
 - With JavaScript disabled the diagram still renders — it is server-side SVG,
   it just doesn't pan or zoom.
