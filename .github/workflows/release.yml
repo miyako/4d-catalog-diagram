@@ -62,14 +62,19 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/4d-catalog-diagram"
           file "$bin"
-          file "$bin" | grep -q "statically linked" || {
+          # musl links x86_64 as a static-PIE and aarch64 as a plain static
+          # executable, so `file` says "static-pie linked" on one and
+          # "statically linked" on the other. Both are static; only
+          # "dynamically linked" is a failure.
+          if ! file "$bin" | grep -qE "static-pie linked|statically linked"; then
             echo "::error::binary is not statically linked"
             exit 1
-          }
-          # A static binary has no dynamic dependencies at all.
-          if ldd "$bin" 2>&1 | grep -qv "not a dynamic executable"; then
+          fi
+          # The authoritative check: a static binary needs no shared library.
+          # `ldd` is unreliable here because it reports a static-PIE as
+          # "statically linked" rather than "not a dynamic executable".
+          if readelf -d "$bin" | grep "NEEDED"; then
             echo "::error::unexpected dynamic dependencies"
-            ldd "$bin"
             exit 1
           fi
 
@@ -102,7 +107,10 @@ jobs:
         include:
           - arch: x64
             target: x86_64-apple-darwin
-            runner: macos-13
+            # macos-13 was retired on 2025-12-04 and silently queues forever.
+            # macos-15-intel is the supported x86_64 image (until late 2027)
+            # and keeps this binary tested on its own architecture.
+            runner: macos-15-intel
           - arch: arm64
             target: aarch64-apple-darwin
             runner: macos-14
