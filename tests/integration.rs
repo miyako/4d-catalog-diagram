@@ -239,6 +239,41 @@ fn focus_render_contains_exactly_the_selected_tables() {
 }
 
 #[test]
+fn every_edge_marker_is_defined() {
+    // Crow's-foot and bar markers are keyed by colour so that several scenes can
+    // share one <defs> block without colliding on ids. A dangling reference
+    // silently renders a connector with no endpoints, so check both directions.
+    let catalog = invoices();
+    let selection = select::select(&catalog, &spec()).unwrap();
+    let svg = render(&catalog, &selection, LayoutMode::AsDesigned, false);
+    let doc = roxmltree::Document::parse(&svg).unwrap();
+
+    let defined: std::collections::BTreeSet<&str> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("marker"))
+        .filter_map(|n| n.attribute("id"))
+        .collect();
+    assert!(!defined.is_empty(), "no markers were emitted");
+
+    let mut referenced = std::collections::BTreeSet::new();
+    for node in doc.descendants() {
+        for attribute in ["marker-start", "marker-end"] {
+            if let Some(value) = node.attribute(attribute) {
+                let id = value.trim_start_matches("url(#").trim_end_matches(')');
+                referenced.insert(id.to_string());
+            }
+        }
+    }
+    assert!(!referenced.is_empty(), "no edge referenced a marker");
+    for id in &referenced {
+        assert!(
+            defined.contains(id.as_str()),
+            "edge references undefined marker {id}"
+        );
+    }
+}
+
+#[test]
 fn rendering_twice_is_byte_identical() {
     let catalog = invoices();
     let selection = select::select(&catalog, &spec()).unwrap();
